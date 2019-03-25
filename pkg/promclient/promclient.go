@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/improbable-eng/thanos/pkg/store/storepb"
+
 	"github.com/go-kit/kit/log"
 	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/improbable-eng/thanos/pkg/tracing"
@@ -25,7 +27,7 @@ import (
 	promlabels "github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/tsdb/labels"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 // IsWALFileAccesible returns no error if WAL dir can be found. This helps to tell
@@ -242,24 +244,53 @@ func Snapshot(ctx context.Context, logger log.Logger, base *url.URL, skipHead bo
 	return path.Join("snapshots", d.Data.Name), nil
 }
 
+type QueryOptions struct {
+	Deduplicate             bool
+	PartialResponseStrategy storepb.PartialResponseStrategy
+}
+
+func (p *QueryOptions) AddTo(values url.Values) error {
+	values.Add("dedup", fmt.Sprintf("%v", p.Deduplicate))
+
+	var partialResponseValue string
+	switch p.PartialResponseStrategy {
+	case storepb.PartialResponseStrategy_WARN:
+		partialResponseValue = strconv.FormatBool(true)
+	case storepb.PartialResponseStrategy_ABORT:
+		partialResponseValue = strconv.FormatBool(false)
+	default:
+		return errors.Errorf("unknown partial response strategy %v", p.PartialResponseStrategy)
+	}
+
+	// TODO(bwplotka): Apply change from bool to strategy in Query API as well.
+	values.Add("partial_response", partialResponseValue)
+
+	return nil
+}
+
 // QueryInstant performs instant query and returns results in model.Vector type.
-func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query string, t time.Time, dedup bool) (model.Vector, error) {
+func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query string, t time.Time, opts QueryOptions) (model.Vector, []string, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 
-	u := *base
-	u.Path = path.Join(u.Path, "/api/v1/query")
-
-	params := url.Values{}
+	params, err := url.ParseQuery(base.RawQuery)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "parse raw query %s", base.RawQuery)
+	}
 	params.Add("query", query)
 	params.Add("time", t.Format(time.RFC3339Nano))
-	params.Add("dedup", fmt.Sprintf("%v", dedup))
+	if err := opts.AddTo(params); err != nil {
+		return nil, nil, errors.Wrap(err, "add thanos opts query params")
+	}
+
+	u := *base
+	u.Path = path.Join(u.Path, "/api/v1/query")
 	u.RawQuery = params.Encode()
 
 	req, err := http.NewRequest("GET", u.String(), nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, errors.Wrap(err, "create GET request")
 	}
 
 	req = req.WithContext(ctx)
@@ -269,7 +300,7 @@ func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query s
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, errors.Wrapf(err, "perform GET request against %s", u.String())
 	}
 	defer runutil.CloseWithLogOnErr(logger, resp.Body, "query body")
 
@@ -280,10 +311,13 @@ func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query s
 			ResultType string          `json:"resultType"`
 			Result     json.RawMessage `json:"result"`
 		} `json:"data"`
+
+		// Extra field supported by Thanos Querier.
+		Warnings []string `json:"warnings"`
 	}
 
 	if err = json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return nil, err
+		return nil, nil, errors.Wrap(err, "decode query instant response")
 	}
 
 	var vectorResult model.Vector
@@ -293,24 +327,24 @@ func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query s
 	switch m.Data.ResultType {
 	case promql.ValueTypeVector:
 		if err = json.Unmarshal(m.Data.Result, &vectorResult); err != nil {
-			return nil, err
+			return nil, nil, errors.Wrap(err, "decode result into ValueTypeVector")
 		}
 	case promql.ValueTypeScalar:
 		vectorResult, err = convertScalarJSONToVector(m.Data.Result)
 		if err != nil {
-			return nil, err
+			return nil, nil, errors.Wrap(err, "decode result into ValueTypeScalar")
 		}
 	default:
-		return nil, errors.Errorf("unknown response type: '%q'", m.Data.ResultType)
+		return nil, nil, errors.Errorf("unknown response type: '%q'", m.Data.ResultType)
 	}
-	return vectorResult, nil
+	return vectorResult, m.Warnings, nil
 }
 
 // PromqlQueryInstant performs instant query and returns results in promql.Vector type that is compatible with promql package.
-func PromqlQueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query string, t time.Time, dedup bool) (promql.Vector, error) {
-	vectorResult, err := QueryInstant(ctx, logger, base, query, t, dedup)
+func PromqlQueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query string, t time.Time, opts QueryOptions) (promql.Vector, []string, error) {
+	vectorResult, warnings, err := QueryInstant(ctx, logger, base, query, t, opts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	vec := make(promql.Vector, 0, len(vectorResult))
@@ -332,7 +366,7 @@ func PromqlQueryInstant(ctx context.Context, logger log.Logger, base *url.URL, q
 		})
 	}
 
-	return vec, nil
+	return vec, warnings, nil
 }
 
 // Scalar response consists of array with mixed types so it needs to be

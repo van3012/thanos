@@ -6,31 +6,32 @@ import (
 	"time"
 
 	"github.com/NYTimes/gziphandler"
-	qapi "github.com/improbable-eng/thanos/pkg/query/api"
-	"github.com/improbable-eng/thanos/pkg/tracing"
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/go-kit/kit/log"
-	"github.com/opentracing/opentracing-go"
+	qapi "github.com/improbable-eng/thanos/pkg/query/api"
+	thanosrule "github.com/improbable-eng/thanos/pkg/rule"
+	"github.com/improbable-eng/thanos/pkg/store/storepb"
+	"github.com/improbable-eng/thanos/pkg/tracing"
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/rules"
 )
 
 type API struct {
-	logger         log.Logger
-	now            func() time.Time
-	rulesRetriever rulesRetriever
+	logger        log.Logger
+	now           func() time.Time
+	ruleRetriever RulesRetriever
 }
 
 func NewAPI(
 	logger log.Logger,
-	rr rulesRetriever,
+	ruleRetriever RulesRetriever,
 ) *API {
 	return &API{
-		logger:         logger,
-		now:            time.Now,
-		rulesRetriever: rr,
+		logger:        logger,
+		now:           time.Now,
+		ruleRetriever: ruleRetriever,
 	}
 }
 
@@ -54,20 +55,20 @@ func (api *API) Register(r *route.Router, tracer opentracing.Tracer, logger log.
 
 }
 
-type rulesRetriever interface {
-	RuleGroups() []*rules.Group
-	AlertingRules() []*rules.AlertingRule
+type RulesRetriever interface {
+	RuleGroups() []thanosrule.Group
+	AlertingRules() []thanosrule.AlertingRule
 }
 
 func (api *API) rules(r *http.Request) (interface{}, []error, *qapi.ApiError) {
-	ruleGroups := api.rulesRetriever.RuleGroups()
-	res := &RuleDiscovery{RuleGroups: make([]*RuleGroup, len(ruleGroups))}
-	for i, grp := range ruleGroups {
+	res := &RuleDiscovery{}
+	for _, grp := range api.ruleRetriever.RuleGroups() {
 		apiRuleGroup := &RuleGroup{
-			Name:     grp.Name(),
-			File:     grp.File(),
-			Interval: grp.Interval().Seconds(),
-			Rules:    []rule{},
+			Name:                    grp.Name(),
+			File:                    grp.File(),
+			Interval:                grp.Interval().Seconds(),
+			Rules:                   []rule{},
+			PartialResponseStrategy: grp.PartialResponseStrategy.String(),
 		}
 
 		for _, r := range grp.Rules() {
@@ -86,7 +87,7 @@ func (api *API) rules(r *http.Request) (interface{}, []error, *qapi.ApiError) {
 					Duration:    rule.Duration().Seconds(),
 					Labels:      rule.Labels(),
 					Annotations: rule.Annotations(),
-					Alerts:      rulesAlertsToAPIAlerts(rule.ActiveAlerts()),
+					Alerts:      rulesAlertsToAPIAlerts(grp.PartialResponseStrategy, rule.ActiveAlerts()),
 					Health:      rule.Health(),
 					LastError:   lastError,
 					Type:        "alerting",
@@ -107,22 +108,20 @@ func (api *API) rules(r *http.Request) (interface{}, []error, *qapi.ApiError) {
 
 			apiRuleGroup.Rules = append(apiRuleGroup.Rules, enrichedRule)
 		}
-		res.RuleGroups[i] = apiRuleGroup
+		res.RuleGroups = append(res.RuleGroups, apiRuleGroup)
 	}
+
 	return res, nil, nil
 }
 
 func (api *API) alerts(r *http.Request) (interface{}, []error, *qapi.ApiError) {
-	alertingRules := api.rulesRetriever.AlertingRules()
-	alerts := []*Alert{}
-
-	for _, alertingRule := range alertingRules {
+	var alerts []*Alert
+	for _, alertingRule := range api.ruleRetriever.AlertingRules() {
 		alerts = append(
 			alerts,
-			rulesAlertsToAPIAlerts(alertingRule.ActiveAlerts())...,
+			rulesAlertsToAPIAlerts(alertingRule.PartialResponseStrategy, alertingRule.ActiveAlerts())...,
 		)
 	}
-
 	res := &AlertDiscovery{Alerts: alerts}
 
 	return res, nil, nil
@@ -133,22 +132,24 @@ type AlertDiscovery struct {
 }
 
 type Alert struct {
-	Labels      labels.Labels `json:"labels"`
-	Annotations labels.Labels `json:"annotations"`
-	State       string        `json:"state"`
-	ActiveAt    *time.Time    `json:"activeAt,omitempty"`
-	Value       float64       `json:"value"`
+	Labels                  labels.Labels `json:"labels"`
+	Annotations             labels.Labels `json:"annotations"`
+	State                   string        `json:"state"`
+	ActiveAt                *time.Time    `json:"activeAt,omitempty"`
+	Value                   float64       `json:"value"`
+	PartialResponseStrategy string        `json:"partial_response_strategy"`
 }
 
-func rulesAlertsToAPIAlerts(rulesAlerts []*rules.Alert) []*Alert {
+func rulesAlertsToAPIAlerts(s storepb.PartialResponseStrategy, rulesAlerts []*rules.Alert) []*Alert {
 	apiAlerts := make([]*Alert, len(rulesAlerts))
 	for i, ruleAlert := range rulesAlerts {
 		apiAlerts[i] = &Alert{
-			Labels:      ruleAlert.Labels,
-			Annotations: ruleAlert.Annotations,
-			State:       ruleAlert.State.String(),
-			ActiveAt:    &ruleAlert.ActiveAt,
-			Value:       ruleAlert.Value,
+			PartialResponseStrategy: s.String(),
+			Labels:                  ruleAlert.Labels,
+			Annotations:             ruleAlert.Annotations,
+			State:                   ruleAlert.State.String(),
+			ActiveAt:                &ruleAlert.ActiveAt,
+			Value:                   ruleAlert.Value,
 		}
 	}
 
@@ -165,8 +166,9 @@ type RuleGroup struct {
 	// In order to preserve rule ordering, while exposing type (alerting or recording)
 	// specific properties, both alerting and recording rules are exposed in the
 	// same array.
-	Rules    []rule  `json:"rules"`
-	Interval float64 `json:"interval"`
+	Rules                   []rule  `json:"rules"`
+	Interval                float64 `json:"interval"`
+	PartialResponseStrategy string  `json:"partial_response_strategy"`
 }
 
 type rule interface{}
